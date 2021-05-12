@@ -118,7 +118,7 @@ class MplWidget(QtWidgets.QWidget):
         self.setLayout(self.vbl)
 
 
-        self.start = 200
+        self.start = 9250
 
     def update_plot(self):
         
@@ -140,7 +140,7 @@ class MplWidget(QtWidgets.QWidget):
         self.start += 1
         self.end +=1
         print(time.time()-t_t)
-        QTimer.singleShot(2000,self.update_plot)
+        QTimer.singleShot(1000,self.update_plot)
 
     def update_params(self):
 
