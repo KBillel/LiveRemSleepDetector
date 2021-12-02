@@ -3,6 +3,8 @@ import socket
 import utilities as u
 from PyQt5 import QtCore
 import re
+from io import BytesIO
+from multiprocessing import Queue
 
 
 class TcpHandler(QtCore.QObject):
@@ -51,7 +53,7 @@ class TcpHandler(QtCore.QObject):
 
 
 class IntanMaster(TcpHandler):
-    COMMAND_BUFFER_sIZE = 1024
+    COMMAND_BUFFER_SIZE = 1024
     channel_set = QtCore.pyqtSignal(int)
 
     def __init__(self, ip='127.0.0.1', port=5000, auto_retry=False, logname='LRDlog',
@@ -74,6 +76,7 @@ class IntanMaster(TcpHandler):
             self.send_cmd(cmd)
 
     def clear_all_data_outputs(self):
+        self.send_cmd('set runmode stop')
         self.send_cmd('execute clearalldataoutputs')
 
     def connect(self):
@@ -95,8 +98,10 @@ class IntanMaster(TcpHandler):
             self.ping_timer.start(self.ping_delay)
 
     def run(self):
-        cmd = 'set runmode run'
-        self.send_cmd(cmd)
+        cmd = 'set runmode record'
+        r = self.send_cmd(cmd)
+        if r:
+            self.send_cmd('set runmode run')
 
     def start_pinging(self):
         self.ping_timer.start(self.ping_delay)
@@ -106,7 +111,7 @@ class IntanMaster(TcpHandler):
 
     def read_data(self):
         try:
-            ret = self.socket.recv(self.COMMAND_BUFFER_sIZE)
+            ret = self.socket.recv(self.COMMAND_BUFFER_SIZE)
             s_ret = ret.decode('utf-8')
             return s_ret
         except (socket.timeout, BrokenPipeError, OSError):
@@ -142,39 +147,133 @@ class IntanMaster(TcpHandler):
         self.send_cmd(cmd)
 
 
+class DataFifo:
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.buffer = BytesIO()
+        self.avail = 0
+        self.size = 0
+        self.write_fp = 0
+
+    def read(self, size=None):
+        """
+        Read data from circular buffer
+
+        Parameters
+        ----------
+        size: Optional, int
+
+        Returns
+        -------
+        result: bytes
+        """
+        if size is None or size > self.avail:
+            size = self.avail
+        size = max(size, 0)
+
+        result = self.buffer.read(size)
+        self.avail -= size
+
+        # If we did not read enough from the end, complete it with the beginning (circular buffer)
+        if len(result) < size:
+            self.buffer.seek(0)
+            result += self.buffer.read(size-len(result))
+
+        return result
+
+    def write(self, data):
+        """
+        Append data to buffer
+
+        Parameters
+        ----------
+        data: bytes
+
+        Returns
+        -------
+
+        """
+        if self.size < self.avail + len(data):
+            # We need to expand the buffer
+            new_buffer = BytesIO()
+            new_buffer.write(self.read())  # Write whatever we currently have
+            self.avail = new_buffer.tell()
+            self.write_fp = self.avail
+            read_fp = 0
+            while self.size <= self.avail + len(data):
+                self.size = max(self.size, 1024) * 2
+            new_buffer.write(b'0' * (self.size - self.write_fp))  # Initialize
+            self.buffer = new_buffer
+        else:
+            read_fp = self.buffer.tell()
+        self.buffer.seek(self.write_fp)
+        written = self.size - self.write_fp
+        self.buffer.write(data[:written])
+        self.write_fp += len(data)
+        self.avail += len(data)
+        if written < len(data):
+            self.write_fp -= self.size
+            self.buffer.seek(0)
+            self.buffer.write(data[written:])
+        self.buffer.seek(read_fp)
+
+
 class Streamer(TcpHandler):
     data_ready = QtCore.pyqtSignal(dict)
     data_error = QtCore.pyqtSignal()
+    magic_size = 1540
 
-    def __init__(self, ip='127.0.0.1', port=5001, auto_retry=False, logname='LRDlog', n_channels=4):
+    def __init__(self, queue: Queue, ip='127.0.0.1', port=5001, auto_retry=False,
+                 logname='LRDlog', n_channels=4):
         super().__init__(ip, port, auto_retry, logname)
+        self.queue = queue
         self.n_channels = n_channels
         self.read_delay = 1
-        self.socket.settimeout(1)
+        self.parse_delay = 3
+        self.socket.settimeout(1)  # Apparently necesary on Windows
         self.stopping = False
+        self.buffer = DataFifo()
+        self.parser_timer = QtCore.QTimer()
+        self.parser_timer.timeout.connect(self.parse)
 
-    def start_stream(self):
-        self.read_timer.start(self.read_delay)
-
-    def stop_stream(self):
-        self.stopping = True
-
-    def read_data(self):
-        try:
-            raw_data = self.socket.recv(144*320*5)
-        except socket.timeout:
-            self.disconnect_ev.emit()
-            self.read_timer.stop()
+    def parse(self):
+        raw_data = self.buffer.read(self.magic_size*15)
+        if len(raw_data) == 0:
             return
-
+        # self.logger.info('Parsing')
         data = u.parse_block(raw_data, self.n_channels)
         if data is None:
-            self.logger.error('Data error')
+            self.logger.error(f'Data error {len(raw_data)}')
             self.data_error.emit()
             if self.stopping:
                 self.stopping = False
                 self.read_timer.stop()
             return
-        data = data.reshape((-1, self.n_channels))
+        # self.buffer = self.buffer[magic_size:]
+        # data = data.reshape((-1, self.n_channels+1))
         # self.data_ready.emit({'lfp': data[:, 0], 'acc': data[:, 1:]})
-        self.data_ready.emit({'data': data})
+        # self.data_ready.emit({'data': data})
+        self.queue.put(data)
+
+    def start_stream(self):
+        self.read_timer.start(self.read_delay)
+        self.parser_timer.start(self.parse_delay)
+
+    def stop_stream(self):
+        self.stopping = True
+
+    def read_data(self):
+        # FIXME: Get rid of this magic number
+
+        try:
+            # raw_data = self.socket.recv(144*320*5)
+            raw_data = self.socket.recv(self.magic_size*30)
+            # raw_data = self.socket.recv(50 * self.magic_size * 3)
+            self.buffer.write(raw_data)
+            # self.logger.info(f'Buffer size: {self.buffer.size}, Data Size {len(raw_data)}')
+        except socket.timeout:
+            self.disconnect_ev.emit()
+            self.read_timer.stop()
+            return
+

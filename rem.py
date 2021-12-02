@@ -30,31 +30,31 @@ def lowpass(sig, cut, fs=1250, order=4):
 def downsample(raw_sig, factor=16):
     # This is the slowest part of it all
     # zero_phase = False ?
-    dwn = signal.decimate(raw_sig, factor, ftype='fir', axis=0)  # FIR is slower than IIR
+    dwn = signal.decimate(raw_sig, factor, ftype='iir', axis=0)  # FIR is slower than IIR
     return dwn
 
 
-def delta_theta(lfp, low_delta, high_delta, low_theta, high_theta, fs=1250):
+def theta_delta(lfp, low_delta, high_delta, low_theta, high_theta, fs=1250):
     bands = [(low_delta, high_delta), (low_theta, high_theta)]
     nperseg = (2 / low_delta) * fs
     freqs, psd = get_spectrum(lfp, fs, nperseg)
     delta, theta = bandpower(bands, freqs, psd)
-    ratio = delta / theta
-
+    ratio = theta / delta
     return ratio, theta, delta
 
-
 def speed(acc_sig):
-    acc = np.linalg.norm(acc_sig, axis=0)
+    acc = np.linalg.norm(acc_sig, axis=1)
     # med = np.median(acc)
     # mad = np.median(np.abs(acc-med))
     # acc = np.abs(acc-med) / mad
-    acc = np.abs(acc-acc.mean()) / acc.std()
+    # acc = np.abs(acc-acc.mean()) / acc.std()
+    # acc = np.mean(acc)
+    acc = np.mean(np.abs(np.diff(acc)))
     return acc
 
 
 def is_sleeping(lfp, acc, low_delta=.1, high_delta=3, low_theta=4, high_theta=10, fs=1250):
-    ratio, theta, delta = delta_theta(lfp, low_delta, high_delta, low_theta, high_theta, fs=fs)
+    ratio, theta, delta = theta_delta(lfp, low_delta, high_delta, low_theta, high_theta, fs=fs)
     motion = speed(acc)
     return ratio, theta, delta, motion
 
@@ -72,7 +72,8 @@ def get_spectrum(data: np.ndarray, sf, nperseg):
 
     Returns
     -------
-
+    freqs
+    psd
     """
 
     # nperseg = (2 / low) * sf
